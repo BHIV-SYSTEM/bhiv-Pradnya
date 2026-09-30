@@ -1,0 +1,266 @@
+
+name: Pradnya Production CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pradnya-production
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate project
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check required files
+        run: |
+          set -e
+          test -f main.py
+          test -f requirements.txt
+          test -f frontend/package.json
+          test -f frontend/package-lock.json
+          test -f frontend/Dockerfile
+          test -f frontend/nginx.conf
+          test -f Dockerfile
+          test -f docker-compose.production.yml
+
+      - name: Validate Compose
+        run: docker compose -f docker-compose.production.yml config
+        env:
+          DOCKER_USERNAME: bhiv
+          IMAGE_TAG: validation
+
+  build:
+    name: Build and push images
+    runs-on: ubuntu-latest
+    needs: validate
+
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate image tag
+        id: vars
+        run: echo "image_tag=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/pradnya-backend:${{ steps.vars.outputs.image_tag }}
+            ${{ secrets.DOCKER_USERNAME }}/pradnya-backend:latest
+
+      - name: Create frontend production environment
+        env:
+          FRONTEND_ENV: ${{ secrets.PRADNYA_FRONTEND_ENV_FILE }}
+        run: |
+          set -e
+          test -n "$FRONTEND_ENV" || {
+            echo "Missing PRADNYA_FRONTEND_ENV_FILE secret"
+            exit 1
+          }
+          printf '%s\n' "$FRONTEND_ENV" > frontend/.env.production
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/pradnya-frontend:${{ steps.vars.outputs.image_tag }}
+            ${{ secrets.DOCKER_USERNAME }}/pradnya-frontend:latest
+
+  deploy:
+    name: Copy Compose file and deploy to VM
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install SSH tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Copy only Compose file to VM
+        env:
+          VM_IP: ${{ secrets.VM_IP }}
+          VM_USERNAME: ${{ secrets.VM_USERNAME }}
+          VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+          VM_PORT: ${{ secrets.VM_PORT }}
+        run: |
+          set -euo pipefail
+
+          sshpass -p "$VM_PASSWORD" ssh \
+            -p "$VM_PORT" \
+            -o StrictHostKeyChecking=no \
+            "$VM_USERNAME@$VM_IP" \
+            "mkdir -p ~/PRADNYA"
+
+          sshpass -p "$VM_PASSWORD" scp \
+            -P "$VM_PORT" \
+            -o StrictHostKeyChecking=no \
+            docker-compose.production.yml \
+            "$VM_USERNAME@$VM_IP:~/PRADNYA/docker-compose.production.yml"
+
+      - name: Pull, deploy, and verify
+        env:
+          VM_IP: ${{ secrets.VM_IP }}
+          VM_USERNAME: ${{ secrets.VM_USERNAME }}
+          VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+          VM_PORT: ${{ secrets.VM_PORT }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          ALLOWED_ORIGINS: ${{ secrets.PRADNYA_ALLOWED_ORIGINS }}
+        run: |
+          set -euo pipefail
+
+          # Encode secrets so special characters don't break the remote shell.
+          PASSWORD_B64="$(printf '%s' "$DOCKER_PASSWORD" | base64 -w 0)"
+          ORIGINS_B64="$(printf '%s' "$ALLOWED_ORIGINS" | base64 -w 0)"
+
+          sshpass -p "$VM_PASSWORD" ssh \
+            -p "$VM_PORT" \
+            -o StrictHostKeyChecking=no \
+            "$VM_USERNAME@$VM_IP" \
+            "bash -s" <<REMOTE
+          set -euo pipefail
+          cd ~/PRADNYA
+
+          export DOCKER_USERNAME='$DOCKER_USERNAME'
+          export IMAGE_TAG='$IMAGE_TAG'
+          export PRADNYA_ALLOWED_ORIGINS="\$(printf '%s' '$ORIGINS_B64' | base64 -d)"
+          DOCKER_PASSWORD_DECODED="\$(printf '%s' '$PASSWORD_B64' | base64 -d)"
+
+          printf '%s' "\$DOCKER_PASSWORD_DECODED" | docker login \
+            -u "\$DOCKER_USERNAME" --password-stdin
+          unset DOCKER_PASSWORD_DECODED
+
+          docker version
+          docker compose version
+
+          docker compose -f docker-compose.production.yml config
+          docker compose -f docker-compose.production.yml pull
+          docker compose -f docker-compose.production.yml up -d --remove-orphans
+          docker compose -f docker-compose.production.yml ps
+
+          echo "Waiting for health checks..."
+          for i in {1..18}; do
+            API_OK=0
+            WEB_OK=0
+
+            curl -fsS http://127.0.0.1:30308/health >/dev/null && API_OK=1 || true
+            curl -fsS http://127.0.0.1:30309/ >/dev/null && WEB_OK=1 || true
+
+            if [ "\$API_OK" -eq 1 ] && [ "\$WEB_OK" -eq 1 ]; then
+              echo "\$IMAGE_TAG" > ~/PRADNYA/.last-successful-image-tag
+              echo "Pradnya deployment passed health checks."
+              docker logout || true
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          docker compose -f docker-compose.production.yml ps
+          docker compose -f docker-compose.production.yml logs --tail=100
+          docker logout || true
+          exit 1
+          REMOTE
+
+  rollback:
+    name: Restore previous successful version
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - deploy
+    if: always() && needs.deploy.result == 'failure' && needs.build.result == 'success'
+
+    steps:
+      - name: Install SSH tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Roll back on VM
+        env:
+          VM_IP: ${{ secrets.VM_IP }}
+          VM_USERNAME: ${{ secrets.VM_USERNAME }}
+          VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+          VM_PORT: ${{ secrets.VM_PORT }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          PASSWORD_B64="$(printf '%s' "$DOCKER_PASSWORD" | base64 -w 0)"
+
+          sshpass -p "$VM_PASSWORD" ssh \
+            -p "$VM_PORT" \
+            -o StrictHostKeyChecking=no \
+            "$VM_USERNAME@$VM_IP" \
+            "bash -s" <<REMOTE
+          set -euo pipefail
+          cd ~/PRADNYA
+
+          if [ ! -f .last-successful-image-tag ]; then
+            echo "No previous successful version exists; rollback is unavailable."
+            exit 1
+          fi
+
+          PREVIOUS_TAG="\$(cat .last-successful-image-tag)"
+          export DOCKER_USERNAME='$DOCKER_USERNAME'
+          export IMAGE_TAG="\$PREVIOUS_TAG"
+          DOCKER_PASSWORD_DECODED="\$(printf '%s' '$PASSWORD_B64' | base64 -d)"
+
+          printf '%s' "\$DOCKER_PASSWORD_DECODED" | docker login \
+            -u "\$DOCKER_USERNAME" --password-stdin
+          unset DOCKER_PASSWORD_DECODED
+
+          docker compose -f docker-compose.production.yml pull
+          docker compose -f docker-compose.production.yml up -d --remove-orphans
+
+          for i in {1..18}; do
+            if curl -fsS http://127.0.0.1:30308/health >/dev/null \
+              && curl -fsS http://127.0.0.1:30309/ >/dev/null; then
+              echo "Rollback to \$PREVIOUS_TAG passed health checks."
+              docker logout || true
+              exit 0
+            fi
+            sleep 10
+          done
+
+          docker compose -f docker-compose.production.yml logs --tail=100
+          docker logout || true
+          exit 1
+          REMOTE
