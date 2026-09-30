@@ -14,39 +14,40 @@ concurrency:
   group: pradnya-production
   cancel-in-progress: false
 
-env:
-  IMAGE_TAG: ${{ github.sha }}
-
 jobs:
   validate:
-    name: Validate configuration
+    name: Validate repository
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Check required files
         shell: bash
         run: |
           set -euo pipefail
-          for file in \
-            main.py \
-            requirements.txt \
-            Dockerfile \
-            docker-compose.production.yml \
-            frontend/Dockerfile \
-            frontend/nginx.conf \
-            frontend/package.json \
+
+          files=(
+            main.py
+            requirements.txt
+            Dockerfile
+            .dockerignore
+            docker-compose.production.yml
+            frontend/Dockerfile
+            frontend/nginx.conf
+            frontend/package.json
             frontend/package-lock.json
-          do
-            test -f "$file" || {
-              echo "Missing required file: $file"
+          )
+
+          for file in "${files[@]}"; do
+            if [[ ! -f "$file" ]]; then
+              echo "::error::Required file missing: $file"
               exit 1
-            }
+            fi
           done
 
-      - name: Validate Docker Compose
+      - name: Validate Compose configuration
         env:
           DOCKER_USERNAME: validation
           IMAGE_TAG: validation
@@ -54,18 +55,34 @@ jobs:
         run: docker compose -f docker-compose.production.yml config -q
 
   build-and-push:
-    name: Build and push Docker images
+    name: Build and push images
     runs-on: ubuntu-latest
     needs: validate
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Validate Docker Hub credentials
+        shell: bash
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [[ -n "$DOCKER_USERNAME" ]] || {
+            echo "::error::Missing DOCKER_USERNAME secret"
+            exit 1
+          }
+          [[ -n "$DOCKER_PASSWORD" ]] || {
+            echo "::error::Missing DOCKER_PASSWORD secret"
+            exit 1
+          }
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
+      - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
@@ -103,112 +120,156 @@ jobs:
     needs: build-and-push
     environment: production
 
+    env:
+      VM_HOST: ${{ secrets.VM_HOST }}
+      VM_USERNAME: ${{ secrets.VM_USERNAME }}
+      VM_PORT: ${{ secrets.VM_PORT }}
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      IMAGE_TAG: ${{ github.sha }}
+      PRADNYA_ALLOWED_ORIGINS: ${{ vars.PRADNYA_ALLOWED_ORIGINS }}
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install SSH tools
-        run: sudo apt-get update && sudo apt-get install -y sshpass
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
 
-      - name: Copy production Compose file
+      - name: Validate deployment secrets
+        shell: bash
         env:
           SSHPASS: ${{ secrets.VM_PASSWORD }}
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USERNAME: ${{ secrets.VM_USERNAME }}
-          VM_PORT: ${{ secrets.VM_PORT }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          for name in VM_HOST VM_USERNAME SSHPASS DOCKER_USERNAME DOCKER_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required secret or variable is missing: $name"
+              exit 1
+            fi
+          done
+
+      - name: Configure SSH host verification
         shell: bash
         run: |
           set -euo pipefail
+
           PORT="${VM_PORT:-22}"
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
 
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
+          ssh-keyscan -p "$PORT" -H "$VM_HOST" \
+            >> "$HOME/.ssh/known_hosts"
 
-          ssh-keyscan -p "$PORT" -H "$VM_HOST" >> ~/.ssh/known_hosts
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Copy Compose configuration to VM
+        shell: bash
+        env:
+          SSHPASS: ${{ secrets.VM_PASSWORD }}
+        run: |
+          set -euo pipefail
 
           sshpass -e scp \
-            -P "$PORT" \
+            -o StrictHostKeyChecking=yes \
+            -P "${VM_PORT:-22}" \
             docker-compose.production.yml \
-            "$VM_USERNAME@$VM_HOST:~/docker-compose.production.yml"
+            "$VM_USERNAME@$VM_HOST:docker-compose.production.yml"
 
-      - name: Deploy and verify, with rollback attempt
+      - name: Deploy and verify
+        shell: bash
         env:
           SSHPASS: ${{ secrets.VM_PASSWORD }}
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USERNAME: ${{ secrets.VM_USERNAME }}
-          VM_PORT: ${{ secrets.VM_PORT }}
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-          PRADNYA_ALLOWED_ORIGINS: ${{ vars.PRADNYA_ALLOWED_ORIGINS }}
-          IMAGE_TAG: ${{ github.sha }}
-        shell: bash
         run: |
           set -euo pipefail
 
-          PORT="${VM_PORT:-22}"
-          ORIGINS="${PRADNYA_ALLOWED_ORIGINS:-http://localhost:8025}"
           PASSWORD_B64="$(printf '%s' "$DOCKER_PASSWORD" | base64 -w 0)"
+          ORIGINS="${PRADNYA_ALLOWED_ORIGINS:-http://localhost:8025}"
           ORIGINS_B64="$(printf '%s' "$ORIGINS" | base64 -w 0)"
 
           sshpass -e ssh \
-            -p "$PORT" \
+            -o StrictHostKeyChecking=yes \
+            -p "${VM_PORT:-22}" \
             "$VM_USERNAME@$VM_HOST" \
-            "DOCKER_USERNAME='$DOCKER_USERNAME' IMAGE_TAG='$IMAGE_TAG' PASSWORD_B64='$PASSWORD_B64' ORIGINS_B64='$ORIGINS_B64' bash -s" <<'REMOTE'
-          set -euo pipefail
+            "bash -s" <<REMOTE
+          set -Eeuo pipefail
 
-          APP_DIR="$HOME/PRADNYA"
-          mkdir -p "$APP_DIR"
-          mv "$HOME/docker-compose.production.yml" "$APP_DIR/docker-compose.production.yml"
-          cd "$APP_DIR"
+          APP_DIR="\$HOME/PRADNYA"
+          mkdir -p "\$APP_DIR"
 
-          export DOCKER_USERNAME IMAGE_TAG
-          export PRADNYA_ALLOWED_ORIGINS
-          PRADNYA_ALLOWED_ORIGINS="$(printf '%s' "$ORIGINS_B64" | base64 -d)"
+          install -m 600 "\$HOME/docker-compose.production.yml" \
+            "\$APP_DIR/docker-compose.production.yml"
+          cd "\$APP_DIR"
 
-          # Authenticate so private Docker Hub images can be pulled.
-          printf '%s' "$PASSWORD_B64" | base64 -d |
-            docker login -u "$DOCKER_USERNAME" --password-stdin
+          export DOCKER_USERNAME='$DOCKER_USERNAME'
+          export IMAGE_TAG='$IMAGE_TAG'
+          export PRADNYA_ALLOWED_ORIGINS="\$(printf '%s' '$ORIGINS_B64' | base64 -d)"
 
-          COMPOSE="docker compose -p pradnya -f docker-compose.production.yml"
-          PREVIOUS_TAG="$(cat .last-successful-image-tag 2>/dev/null || true)"
+          COMPOSE=(docker compose -p pradnya -f docker-compose.production.yml)
 
-          echo "Pulling release: $IMAGE_TAG"
-          $COMPOSE pull
+          echo "Validating Compose configuration..."
+          "\${COMPOSE[@]}" config -q
+
+          echo "Logging into Docker Hub..."
+          printf '%s' '$PASSWORD_B64' | base64 -d |
+            docker login -u "\$DOCKER_USERNAME" --password-stdin
+
+          PREVIOUS_TAG="\$(cat .last-successful-image-tag 2>/dev/null || true)"
+
+          echo "Pulling images for commit \$IMAGE_TAG..."
+          "\${COMPOSE[@]}" pull
 
           check_health() {
             local i
-            for i in $(seq 1 18); do
-              if curl -fsS --max-time 5 http://127.0.0.1:8024/health >/dev/null &&
-                 curl -fsS --max-time 5 http://127.0.0.1:8025/ >/dev/null; then
+
+            for i in \$(seq 1 24); do
+              echo "Health check \$i/24"
+
+              if curl -fsS --max-time 5 \
+                   http://127.0.0.1:8024/health >/dev/null &&
+                 curl -fsS --max-time 5 \
+                   http://127.0.0.1:8025/ >/dev/null; then
+                echo "Backend and frontend HTTP checks passed."
                 return 0
               fi
+
               sleep 5
             done
+
             return 1
           }
 
-          if $COMPOSE up -d --remove-orphans && check_health; then
-            printf '%s\n' "$IMAGE_TAG" > .last-successful-image-tag
-            echo "Deployment succeeded: $IMAGE_TAG"
-            $COMPOSE ps
+          if "\${COMPOSE[@]}" up -d --remove-orphans &&
+             check_health; then
+            printf '%s\n' "\$IMAGE_TAG" > .last-successful-image-tag
+            echo "Deployment successful: \$IMAGE_TAG"
+            "\${COMPOSE[@]}" ps
             exit 0
           fi
 
-          echo "Deployment or health check failed."
-          $COMPOSE logs --tail=100 || true
+          echo "Deployment failed. Collecting diagnostics..."
+          "\${COMPOSE[@]}" ps || true
+          "\${COMPOSE[@]}" logs --tail=150 || true
 
-          if [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$IMAGE_TAG" ]; then
-            echo "Attempting rollback to: $PREVIOUS_TAG"
-            export IMAGE_TAG="$PREVIOUS_TAG"
+          if [[ -n "\$PREVIOUS_TAG" && "\$PREVIOUS_TAG" != "\$IMAGE_TAG" ]]; then
+            echo "Attempting rollback to \$PREVIOUS_TAG..."
+            export IMAGE_TAG="\$PREVIOUS_TAG"
 
-            if $COMPOSE pull && $COMPOSE up -d --remove-orphans && check_health; then
-              echo "Rollback succeeded: $PREVIOUS_TAG"
+            if "\${COMPOSE[@]}" pull &&
+               "\${COMPOSE[@]}" up -d --remove-orphans &&
+               check_health; then
+              echo "Rollback successful: \$PREVIOUS_TAG"
             else
-              echo "Rollback health check failed; manual investigation is required."
-              $COMPOSE logs --tail=100 || true
+              echo "Rollback failed. Manual investigation is required."
+              "\${COMPOSE[@]}" ps || true
+              "\${COMPOSE[@]}" logs --tail=150 || true
             fi
           else
-            echo "No previous successful release is recorded; automatic rollback is unavailable."
+            echo "No previous successful release is recorded."
           fi
 
           exit 1
