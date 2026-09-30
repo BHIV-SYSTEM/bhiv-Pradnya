@@ -2,12 +2,11 @@
 services:
   pradnya-api:
     image: ${DOCKER_USERNAME:?Set DOCKER_USERNAME}/pradnya-backend:${IMAGE_TAG:-latest}
-    container_name: pradnya-api
     restart: unless-stopped
     environment:
-      ALLOWED_ORIGINS: ${PRADNYA_ALLOWED_ORIGINS:-http://localhost:30309}
+      ALLOWED_ORIGINS: ${PRADNYA_ALLOWED_ORIGINS:-http://localhost:8025}
     ports:
-      - "30308:8000"
+      - "8024:8000"
     expose:
       - "8000"
     healthcheck:
@@ -25,13 +24,24 @@ services:
 
   pradnya-web:
     image: ${DOCKER_USERNAME:?Set DOCKER_USERNAME}/pradnya-frontend:${IMAGE_TAG:-latest}
-    container_name: pradnya-web
     restart: unless-stopped
     depends_on:
       pradnya-api:
         condition: service_healthy
     ports:
-      - "30309:80"
+      - "8025:80"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - http://127.0.0.1/
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - pradnya-net
 

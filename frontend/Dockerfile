@@ -7,6 +7,10 @@ COPY package*.json ./
 RUN npm ci
 
 COPY . .
+
+ARG VITE_NICAI_API=/api
+ENV VITE_NICAI_API=${VITE_NICAI_API}
+
 RUN npm run build
 
 FROM nginx:1.27-alpine
